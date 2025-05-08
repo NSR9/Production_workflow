@@ -1,0 +1,14 @@
+[project]
+name = "ezscm-pocs"
+version = "0.1.0"
+description = "A basic FastAPI server setup"
+authors = [{name = "Your Name", email = "you@example.com"}]
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi>=0.95.0",
+    "uvicorn>=0.22.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
