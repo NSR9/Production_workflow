@@ -1,121 +1,157 @@
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Any
+from pydantic import BaseModel
+from typing import List, Optional
 from pymongo import MongoClient
-import sys
-import os
 from datetime import datetime
+from bson.objectid import ObjectId
 
-# Add the production_workflow directory to the Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'production_workflow'))
+from production_workflow.workflow import ProductionGraph
 
-# Import the ProductionGraph class from workflow.py
-from workflow import ProductionGraph
+app = FastAPI(title="Stage-Centric Production Workflow API")
 
-app = FastAPI(title="Production Workflow API")
-
-# MongoDB Connection
-# Replace with your MongoDB connection string if needed
+# MongoDB setup
 MONGO_URI = "mongodb://localhost:27017/"
 client = MongoClient(MONGO_URI)
 db = client["production_workflow_db"]
-workflows_collection = db["workflows"]
+workflows_collection = db["stage_workflows"]
 
-# Pydantic models for request validation
-class GoodBase(BaseModel):
-    name: str
-    
-class RawGood(GoodBase):
-    good_type: str = "Raw"
-    
-class IntermediaryGood(GoodBase):
-    good_type: str = "Intermediary"
-    stage: int
-    
-class FinishedGood(GoodBase):
-    good_type: str = "Finished"
-    
-class Link(BaseModel):
-    source: str
-    target: str
-    quantity: Optional[float] = None
-    unit: Optional[str] = None
-    
-class ProductionWorkflowCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-    raw_goods: List[RawGood]
-    intermediary_goods: List[IntermediaryGood]
-    finished_goods: List[FinishedGood]
-    links: List[Link]
+# Pydantic Models
+class WastageEntry(BaseModel):
+    goodName: str
+    wastage: float
+    wastageType: str
 
-class ProductionWorkflowResponse(ProductionWorkflowCreate):
+class GoodEntry(BaseModel):
+    goodName: str
+    quantity: float
+    unit: str
+
+class ProductionDetails(BaseModel):
+    wastageEntries: List[WastageEntry]
+    productionTime: str
+    outsource: str
+
+class Stage(BaseModel):
+    stageNumber: int
+    rawGoods: List[GoodEntry]
+    outputGoods: List[GoodEntry]
+    productionDetails: ProductionDetails
+
+class StageWorkflowCreate(BaseModel):
+    name: str
+    description: Optional[str]
+    productionStages: List[Stage]
+
+class StageWorkflowResponse(StageWorkflowCreate):
     id: str
     created_at: datetime
-    
+
+# Helper
+
+
+# API Routes
 @app.get("/")
 async def read_root():
     return {"message": "Production Workflow API"}
 
-@app.post("/workflows", response_model=ProductionWorkflowResponse, status_code=status.HTTP_201_CREATED)
-async def create_workflow(workflow: ProductionWorkflowCreate):
+@app.post("/workflows", response_model=StageWorkflowResponse, status_code=status.HTTP_201_CREATED)
+async def create_stage_workflow(workflow: StageWorkflowCreate):
     try:
-        # Create a ProductionGraph instance
         graph = ProductionGraph()
-        
-        # Add raw goods
-        for good in workflow.raw_goods:
-            graph.add_good(good.name, good.good_type)
-            
-        # Add intermediary goods
-        for good in workflow.intermediary_goods:
-            graph.add_good(good.name, good.good_type, stage=good.stage)
-            
-        # Add finished goods
-        for good in workflow.finished_goods:
-            graph.add_good(good.name, good.good_type)
-            
-        # Add links
-        for link in workflow.links:
-            graph.link(link.source, link.target, link.quantity, link.unit)
-        
-        # Convert the workflow to a dictionary for MongoDB
+        graph.load_from_json(workflow.dict())
+        graph.link_stages()
+
         workflow_dict = workflow.dict()
         workflow_dict["created_at"] = datetime.now()
-        
-        # Insert into MongoDB
-        result = workflows_collection.insert_one(workflow_dict)
-        
-        # Return the created workflow with the MongoDB ID
-        response = {**workflow_dict, "id": str(result.inserted_id)}
-        return response
-        
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.get("/workflows", response_model=List[ProductionWorkflowResponse])
-async def get_workflows():
+        result = workflows_collection.insert_one(workflow_dict)
+        return {**workflow_dict, "id": str(result.inserted_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating workflow: {str(e)}")
+
+@app.get("/workflows", response_model=List[StageWorkflowResponse])
+async def list_workflows():
     workflows = []
-    for workflow in workflows_collection.find():
-        workflow["id"] = str(workflow.pop("_id"))
-        workflows.append(workflow)
+    for wf in workflows_collection.find():
+        wf["id"] = str(wf.pop("_id"))
+        workflows.append(wf)
     return workflows
 
-@app.get("/workflows/{workflow_id}", response_model=ProductionWorkflowResponse)
+@app.get("/workflows/{workflow_id}", response_model=StageWorkflowResponse)
 async def get_workflow(workflow_id: str):
-    from bson.objectid import ObjectId
-    
     try:
         workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
-        if workflow:
-            workflow["id"] = str(workflow.pop("_id"))
-            return workflow
-        raise HTTPException(status_code=404, detail=f"Workflow with ID {workflow_id} not found")
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        workflow["id"] = str(workflow.pop("_id"))
+        return workflow
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving workflow: {str(e)}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/workflows/{workflow_id}/dependencies/{finished_good}")
+async def get_dependencies(workflow_id: str, finished_good: str):
+    try:
+        workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        graph = ProductionGraph()
+        graph.load_from_json(workflow)
+        graph.link_stages()
+        fg_node = next((n for n in graph.goods if n.name == finished_good and n.is_finished), None)
+        if not fg_node:
+            raise HTTPException(status_code=404, detail=f"Finished good '{finished_good}' not found")
+
+        raw_deps = set()
+        def trace_raws(node):
+            for parent in node.made_from:
+                if parent.good_type == "Raw":
+                    raw_deps.add((parent.name, parent.quantity, parent.unit))
+                else:
+                    trace_raws(parent)
+
+        trace_raws(fg_node)
+        return {
+            "finished_good": finished_good,
+            "raw_dependencies": [
+                {"name": name, "quantity": qty, "unit": unit} for name, qty, unit in sorted(raw_deps)
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error tracing dependencies: {str(e)}")
+
+@app.get("/workflows/{workflow_id}/display")
+async def display_workflow(workflow_id: str):
+    try:
+        workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        graph = ProductionGraph()
+        graph.load_from_json(workflow)
+        graph.link_stages()
+        response = []
+        for num in sorted(graph.stages):
+            stage = graph.stages[num]
+            response.append({
+                "stageNumber": num,
+                "productionTime": stage.production_time,
+                "outsource": stage.outsource,
+                "wastageEntries": stage.wastage_entries,
+                "rawGoods": [
+                    {"name": g.name, "quantity": g.quantity, "unit": g.unit}
+                    for g in stage.raw_inputs
+                ],
+                "intermediaryGoods": [
+                    {
+                        "name": g.name,
+                        "quantity": g.quantity,
+                        "unit": g.unit,
+                        "from": [p.name for p in g.made_from]
+                    }
+                    for g in stage.outputs
+                ]
+            })
+        return {"stages": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error displaying workflow: {str(e)}")
