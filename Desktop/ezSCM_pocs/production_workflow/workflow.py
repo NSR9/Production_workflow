@@ -1,18 +1,20 @@
 import uuid
-import networkx as nx
-import matplotlib.pyplot as plt
-import graphviz
+from neo4j import GraphDatabase
+
 # -------------------------------
-# Simplified GoodNode and StageNode
+# Node definitions with unique ID prefixes
 # -------------------------------
 
 class GoodNode:
+    PREFIX_MAP = {"Raw": "RG", "Intermediary": "IG", "Finished": "FG"}
+
     def __init__(self, name, quantity=None, unit=None, good_type="Raw", is_finished=False):
-        self.id = f"{good_type[:2].upper()}_{uuid.uuid4().hex}"
+        prefix = GoodNode.PREFIX_MAP.get(good_type, "GD")
+        self.id = f"{prefix}_{uuid.uuid4().hex}"
         self.name = name
         self.quantity = quantity
         self.unit = unit
-        self.good_type = good_type  # "Raw" or "Intermediary"
+        self.good_type = good_type
         self.is_finished = is_finished
         self.used_in = set()
         self.made_from = set()
@@ -23,10 +25,11 @@ class GoodNode:
 
 class StageNode:
     def __init__(self, number, production_time, outsource, wastage_entries):
+        self.id = f"STG_{uuid.uuid4().hex}"
         self.number = number
         self.production_time = production_time
         self.outsource = outsource
-        self.wastage_entries = wastage_entries  # Dict[good_id] = {'wastage': value, 'type': '%|unit'}
+        self.wastage_entries = wastage_entries  # {good_id: {wastage, type}}
         self.raw_inputs = set()
         self.intermediary_inputs = set()
         self.outputs = set()
@@ -37,333 +40,168 @@ class StageNode:
 
 
 # -------------------------------
-# Simplified ProductionGraph
+# ProductionGraph with cleaned relationships
 # -------------------------------
 
 class ProductionGraph:
-    def get_id_by_name(self, name):
-        node = next((n for n in self.goods if n.name == name), None)
-        return node.id if node else None
-
     def __init__(self):
-        self.stages = {}  # stage_number -> StageNode
-        self.goods = set()
+        self.stages = {}        # stage_number -> StageNode
+        self.goods = set()      # set of GoodNode
+        self.name_map = {}      # name -> GoodNode
 
-    def create_good(self, name, quantity=None, unit=None, good_type="Raw", is_finished=False):
+    def get_or_create_good(self, name, quantity=None, unit=None, good_type="Raw", is_finished=False):
+        if name in self.name_map:
+            return self.name_map[name]
         node = GoodNode(name, quantity, unit, good_type, is_finished)
         self.goods.add(node)
+        self.name_map[name] = node
         return node
 
-    def mark_as_finished(self, node):
-        node.is_finished = True
-
-    def add_stage(self, number, production_time, outsource, wastage_entries,
-                  raw_inputs, intermediary_inputs, outputs):
+    def add_stage(self, number, production_time, outsource, wastage_entries, raw_inputs, intermediary_inputs, outputs):
         stage = StageNode(number, production_time, outsource, wastage_entries)
-        stage.raw_inputs.update(raw_inputs)
-        stage.intermediary_inputs.update(intermediary_inputs)
-        stage.outputs.update(outputs)
-
+        stage.raw_inputs = set(raw_inputs)
+        stage.intermediary_inputs = set(intermediary_inputs)
+        stage.outputs = set(outputs)
         for out in outputs:
             for inp in raw_inputs.union(intermediary_inputs):
                 out.made_from.add(inp)
                 inp.used_in.add(out)
-
         self.stages[number] = stage
 
     def link_stages(self):
-        for i in sorted(self.stages):
-            if i + 1 in self.stages:
-                self.stages[i].next_stage = self.stages[i + 1]
-
-    def display(self):
-        print("\n📦 Simplified Production Workflow")
         for num in sorted(self.stages):
-            stage = self.stages[num]
-            print(f"\n🔄 Stage {num}:")
-            print("  ⏱ Time:", stage.production_time)
-            print("  🔧 Outsource:", stage.outsource)
-            print("  🧪 Wastage:")
-            for gid, entry in stage.wastage_entries.items():
-                good = next((g for g in self.goods if g.id == gid), None)
-                if good:
-                    print(f"    - {good.name}: {entry['wastage']}{entry['type']}")
-
-            print("  🔹 Raw Inputs:")
-            for g in stage.raw_inputs:
-                print(f"    - {g.name} ({g.quantity}{g.unit})")
-
-            print("  🔸 Intermediary Inputs:")
-            for g in stage.intermediary_inputs:
-                print(f"    - {g.name} ({g.quantity}{g.unit})")
-
-            print("  🏁 Outputs:")
-            for g in stage.outputs:
-                from_ = ', '.join(i.name for i in g.made_from)
-                print(f"    - {g.name} ← {from_}")
-
-        finished = [g for g in self.goods if g.is_finished]
-        if finished:
-            print("\n✅ Finished Goods:")
-            for g in finished:
-                from_ = ', '.join(i.name for i in g.made_from)
-                print(f"  {g.name} ← {from_}")
+            if num + 1 in self.stages:
+                self.stages[num].next_stage = self.stages[num + 1]
 
     def load_from_json(self, json_obj):
-        name_to_node = {}
-        for stage_data in json_obj["productionStages"]:
-            stage_number = stage_data["stageNumber"]
-            production_time = stage_data["productionDetails"]["productionTime"]
-            outsource = stage_data["productionDetails"]["outsource"]
-            wastage_entries_raw = stage_data["productionDetails"].get("wastageEntries", [])
-
-            raw_nodes = set()
+        for stage_data in json_obj.get("productionStages", []):
+            num = stage_data["stageNumber"]
+            details = stage_data["productionDetails"]
+            raw_nodes, interm_nodes = set(), set()
             for raw in stage_data["rawGoods"]:
-                node = self.create_good(raw["goodName"], raw["quantity"], raw["unit"], good_type="Raw")
-                name_to_node[raw["goodName"]] = node
-                raw_nodes.add(node)
-
-            output_nodes = set()
+                node = self.get_or_create_good(raw["goodName"], raw.get("quantity"), raw.get("unit"), "Raw")
+                (interm_nodes if node.good_type != "Raw" else raw_nodes).add(node)
+            out_nodes = set()
             for out in stage_data["outputGoods"]:
-                node = self.create_good(out["goodName"], out["quantity"], out["unit"], good_type="Intermediary")
-                name_to_node[out["goodName"]] = node
-                output_nodes.add(node)
-
-            intermediary_inputs = set()
-            for raw in stage_data["rawGoods"]:
-                if raw["goodName"] in name_to_node and name_to_node[raw["goodName"]].good_type == "Intermediary":
-                    intermediary_inputs.add(name_to_node[raw["goodName"]])
-
+                is_final = out["goodName"].lower() == "bread & omlet"
+                node = self.get_or_create_good(out["goodName"], out.get("quantity"), out.get("unit"), "Intermediary", is_final)
+                out_nodes.add(node)
             wastage_entries = {}
-            for entry in wastage_entries_raw:
-                good = name_to_node.get(entry["goodName"])
-                if good:
-                    wastage_entries[good.id] = {
-                        "wastage": entry["wastage"],
-                        "type": entry["wastageType"]
-                    }
-
-            self.add_stage(stage_number, production_time, outsource, wastage_entries, raw_nodes, intermediary_inputs, output_nodes)
+            for w in details.get("wastageEntries", []):
+                gnode = self.name_map.get(w["goodName"])
+                if gnode:
+                    wastage_entries[gnode.id] = {"wastage": w["wastage"], "type": w["wastageType"]}
+            self.add_stage(num, details.get("productionTime"), details.get("outsource"), wastage_entries, raw_nodes, interm_nodes, out_nodes)
         self.link_stages()
 
-    def display_node_by_id(self, node_id):
-        node = next((n for n in self.goods if n.id == node_id), None)
-        if not node:
-            print(f"❌ Node with ID '{node_id}' not found.")
-            return
+    def save_to_neo4j(self, uri, user, password):
+        driver = GraphDatabase.driver(uri, auth=(user, password))
+        def tx_func(tx):
+            for st in self.stages.values():
+                tx.run(
+                    "MERGE (s:Stage {id:$id}) SET s.number=$num, s.name='Stage '+toString($num), s.time=$t, s.outsource=$o, s.color='#CCCCCC'",
+                    id=st.id, num=st.number, t=st.production_time, o=st.outsource
+                )
+            for g in self.goods:
+                label = g.good_type + "Good"
+                color = {'Raw':'#ADD8E6','Intermediary':'#FFA500','Finished':'#FF4500'}[g.good_type]
+                tx.run(
+                    f"MERGE (n:Good:{label} {{id:$id}}) SET n.name=$name, n.quantity=$q, n.unit=$u, n.color='{color}'",
+                    id=g.id, name=g.name, q=g.quantity, u=g.unit
+                )
+            for st in self.stages.values():
+                for inp in st.raw_inputs.union(st.intermediary_inputs):
+                    tx.run(
+                        "MATCH (n:Good {id:$gid}), (s:Stage {id:$sid}) MERGE (n)-[:USED_IN]->(s)",
+                        gid=inp.id, sid=st.id
+                    )
+                for out in st.outputs:
+                    tx.run(
+                        "MATCH (s:Stage {id:$sid}), (n:Good {id:$gid}) MERGE (s)-[:PRODUCES]->(n)",
+                        sid=st.id, gid=out.id
+                    )
+                for gid, w in st.wastage_entries.items():
+                    tx.run(
+                        "MATCH (n:Good {id:$gid})-[r:USED_IN]->(s:Stage {id:$sid}) SET r.wastage=$w, r.wastageType=$t",
+                        gid=gid, sid=st.id, w=w['wastage'], t=w['type']
+                    )
+        with driver.session() as session:
+            session.write_transaction(tx_func)
+        driver.close()
 
-        print(f"\n🔎 Node Details for ID: {node_id}")
-        print("Name:", node.name)
-        print("Type:", node.good_type)
-        print("Finished:", node.is_finished)
-        print("Quantity:", node.quantity, node.unit)
-
-        used_in_stages = []
-        as_input_to = []
-        for stage in self.stages.values():
-            if node in stage.raw_inputs or node in stage.intermediary_inputs:
-                used_in_stages.append(stage.number)
-            if node in stage.raw_inputs:
-                for o in stage.outputs:
-                    if node in o.made_from:
-                        as_input_to.append(o.name)
-
-        print("Used In Stages:", used_in_stages)
-        print("Used As Input To Intermediaries:", as_input_to)
-
-        print("\n🧪 Wastage Details:")
-        total_used = 0
-        for stage in self.stages.values():
-            if node in stage.raw_inputs:
-                usage_qty = next((g.quantity for g in stage.raw_inputs if g.name == node.name), 0)
-                total_used += usage_qty
-                print(f"- Stage {stage.number}: Used {usage_qty} {node.unit}")
-                for gid, entry in stage.wastage_entries.items():
-                    if gid == node.id:
-                        print(f"  ↳ Wastage: {entry['wastage']}{entry['type']}")
-
-        print("\n🔢 Total Usage Across Stages:", total_used, node.unit)
-        print("🟢 Defined Quantity in Node:", node.quantity, node.unit)
-        if node.quantity:
-            percent_used = (total_used / node.quantity) * 100
-            print(f"📊 Usage Coverage: {percent_used:.2f}%")
-
-        print("\n🏁 Contributes To Finished Goods:")
-        finished_goods = [g for g in self.goods if g.is_finished]
-        contributed_to = set()
-
-        def trace_upstream(node, target):
-            if node in target.made_from:
-                return True
-            return any(trace_upstream(node, i) for i in target.made_from)
-
-        for fg in finished_goods:
-            if trace_upstream(node, fg):
-                contributed_to.add(fg.name)
-
-        if contributed_to:
-            for name in contributed_to:
-                print(f"  - {name}")
-        else:
-            print("  None")
-
-    def to_json(self):
-        stages = []
-        for number, stage in sorted(self.stages.items()):
-            stage_data = {
-                "stageNumber": number,
-                "rawGoods": [
-                    {"goodName": g.name, "quantity": g.quantity, "unit": g.unit}
-                    for g in stage.raw_inputs
-                ],
-                "outputGoods": [
-                    {"goodName": g.name, "quantity": g.quantity, "unit": g.unit}
-                    for g in stage.outputs
-                ],
-                "productionDetails": {
-                    "wastageEntries": [
-                        {"goodName": next((n.name for n in self.goods if n.id == gid), None),
-                         "wastage": e["wastage"], "wastageType": e["type"]}
-                        for gid, e in stage.wastage_entries.items()
-                    ],
-                    "productionTime": stage.production_time,
-                    "outsource": stage.outsource
-                }
-            }
-            stages.append(stage_data)
-        return {"productionStages": stages}
-
-    def display_stage_by_number(self, stage_number):
-        stage = self.stages.get(stage_number)
-        if not stage:
-            print(f"❌ Stage {stage_number} not found.")
-            return
-        print(f"\n🔍 Stage {stage_number} Details")
-        print("  ⏱ Time:", stage.production_time)
-        print("  🔧 Outsource:", stage.outsource)
-        print("  🧪 Wastage:")
-        for gid, entry in stage.wastage_entries.items():
-            good = next((g for g in self.goods if g.id == gid), None)
-            if good:
-                print(f"    - {good.name}: {entry['wastage']}{entry['type']}")
-        print("  🔹 Raw Inputs:", [g.name for g in stage.raw_inputs])
-        print("  🔸 Intermediary Inputs:", [g.name for g in stage.intermediary_inputs])
-        print("  🏁 Outputs:", [g.name for g in stage.outputs])
-
-    def display_next_stage_info(self, current_stage_number):
-        current_stage = self.stages.get(current_stage_number)
-        if current_stage and current_stage.next_stage:
-            self.display_stage_by_number(current_stage.next_stage.number)
-        else:
-            print(f"🔚 No next stage found for Stage {current_stage_number}.")
-    def generate_graph_image(self):
-        G = nx.DiGraph()
-        pos = {}
-        labels = {}
-        node_colors = []
-        stage_annotations = []
-
-        x_gap = 4
-        y_base = 0
-
-        for stage_number in sorted(self.stages):
-            stage = self.stages[stage_number]
-            x_offset = stage_number * x_gap
-            y = y_base
-
-            # Annotate stage label
-            stage_annotations.append((x_offset + 1, y + 1.5, f"Stage {stage_number}"))
-
-            # Add raw inputs
-            for g in sorted(stage.raw_inputs, key=lambda x: x.name):
-                G.add_node(g.id)
-                pos[g.id] = (x_offset, y)
-                labels[g.id] = f"{g.name}\n{g.quantity}{g.unit}"
-                node_colors.append("skyblue")
-                y -= 1
-
-            # Add intermediary inputs
-            for g in sorted(stage.intermediary_inputs, key=lambda x: x.name):
-                G.add_node(g.id)
-                pos[g.id] = (x_offset + 1, y)
-                labels[g.id] = f"{g.name}\n{g.quantity}{g.unit}"
-                node_colors.append("lightgreen")
-                y -= 1
-
-            # Add outputs
-            for g in sorted(stage.outputs, key=lambda x: x.name):
-                G.add_node(g.id)
-                pos[g.id] = (x_offset + 2, y)
-                labels[g.id] = f"{g.name}\n{g.quantity}{g.unit}"
-                node_colors.append("orange" if g.is_finished else "gold")
-                y -= 1
-
-            # Add edges
-            for out in stage.outputs:
-                for inp in out.made_from:
-                    G.add_edge(inp.id, out.id)
-
-        # Draw graph
-        plt.figure(figsize=(16, 8))
-        nx.draw(G, pos, with_labels=False, node_size=3000,
-                node_color=node_colors, edge_color='gray', arrows=True)
-        nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight="bold")
-
-        # Add stage text labels
-        for (x, y, label) in stage_annotations:
-            plt.text(x, y, label, fontsize=12, fontweight="bold", ha="center", bbox=dict(facecolor='white', alpha=0.6, edgecolor='gray'))
-
-        plt.title("Production Workflow (Stage-Aware Layout)")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.show()
+    def display(self):
+        for num, st in sorted(self.stages.items()):
+            print(f"Stage {num}: RAW={[g.name for g in st.raw_inputs]}, OUT={[g.name for g in st.outputs]}")
 
 # -------------------------------
-# Example usage
+# Example Usage
 # -------------------------------
-if __name__ == "__main__":
-    g = ProductionGraph()
-
+if __name__=='__main__':
     example_json = {
-        "productionStages": [
-            {
-                "stageNumber": 1,
-                "rawGoods": [
-                    {"goodName": "Wheat", "quantity": 100, "unit": "kg"},
-                    {"goodName": "Water", "quantity": 50, "unit": "L"}
-                ],
-                "productionDetails": {
-                    "wastageEntries": [
-                        {"goodName": "Wheat", "wastage": 5, "wastageType": "%"}
-                    ],
-                    "productionTime": "3h 30m",
-                    "outsource": "No"
-                },
-                "outputGoods": [
-                    {"goodName": "Dough", "quantity": 140, "unit": "kg"}
-                ]
+    "productionStages": [
+        {
+            "stageNumber": 1,
+            "rawGoods": [
+                {"goodName": "Wheat", "quantity": 100, "unit": "kg"},
+                {"goodName": "Water", "quantity": 50, "unit": "L"}
+            ],
+            "productionDetails": {
+                "wastageEntries": [],
+                "productionTime": "2h",
+                "outsource": "No"
             },
-            {
-                "stageNumber": 2,
-                "rawGoods": [
-                    {"goodName": "Dough", "quantity": 140, "unit": "kg"},
-                    {"goodName": "Yeast", "quantity": 2, "unit": "kg"}
-                ],
-                "productionDetails": {
-                    "wastageEntries": [
-                        {"goodName": "Dough", "wastage": 2, "wastageType": "%"}
-                    ],
-                    "productionTime": "2h 0m",
-                    "outsource": "No"
-                },
-                "outputGoods": [
-                    {"goodName": "Bread", "quantity": 135, "unit": "kg"}
-                ]
-            }
-        ]
-    }
-
+            "outputGoods": [
+                {"goodName": "Dough", "quantity": 140, "unit": "kg"}
+            ]
+        },
+        {
+            "stageNumber": 2,
+            "rawGoods": [
+                {"goodName": "Dough", "quantity": 140, "unit": "kg"},
+                {"goodName": "Yeast", "quantity": 5, "unit": "kg"}
+            ],
+            "productionDetails": {
+                "wastageEntries": [],
+                "productionTime": "1.5h",
+                "outsource": "No"
+            },
+            "outputGoods": [
+                {"goodName": "Bread", "quantity": 135, "unit": "kg"}
+            ]
+        },
+        {
+            "stageNumber": 3,
+            "rawGoods": [
+                {"goodName": "Eggs", "quantity": 60, "unit": "pcs"},
+                {"goodName": "Water", "quantity": 20, "unit": "L"}
+            ],
+            "productionDetails": {
+                "wastageEntries": [],
+                "productionTime": "1h",
+                "outsource": "No"
+            },
+            "outputGoods": [
+                {"goodName": "Omlet", "quantity": 60, "unit": "pcs"}
+            ]
+        },
+        {
+            "stageNumber": 4,
+            "rawGoods": [
+                {"goodName": "Bread", "quantity": 135, "unit": "kg"},
+                {"goodName": "Omlet", "quantity": 60, "unit": "pcs"}
+            ],
+            "productionDetails": {
+                "wastageEntries": [],
+                "productionTime": "0.5h",
+                "outsource": "No"
+            },
+            "outputGoods": [
+                {"goodName": "Bread & Omlet", "quantity": 195, "unit": "units"}
+            ]
+        }
+    ]
+}
+    g = ProductionGraph()
     g.load_from_json(example_json)
+    g.save_to_neo4j("bolt://localhost:7687","neo4j","12345678")
     g.display()
-    g.generate_graph_image()
-    
