@@ -1,157 +1,271 @@
+import os
+import io
+import sys
+import uuid
+from typing import List, Dict, Any, Set, Optional
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
-from typing import List, Optional
-from pymongo import MongoClient
-from datetime import datetime
-from bson.objectid import ObjectId
+from neo4j import GraphDatabase
 
-from production_workflow.workflow import ProductionGraph
+app = FastAPI(title="Stage-Centric Production Workflow API — Neo4j Aura only")
 
-app = FastAPI(title="Stage-Centric Production Workflow API")
+# Neo4j Aura configuration
+NEO4J_URI = os.getenv("NEO4J_URI", "neo4j+s://08aae6b5.databases.neo4j.io")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "0g6cqKCmb3fOISxP6-J2cy-IwgyQn32NzfTm3ABtYxA")
 
-# MongoDB setup
-MONGO_URI = "mongodb://localhost:27017/"
-client = MongoClient(MONGO_URI)
-db = client["production_workflow_db"]
-workflows_collection = db["stage_workflows"]
+# -------------------------------
+# Workflow graph classes
+# -------------------------------
 
-# Pydantic Models
-class WastageEntry(BaseModel):
+class GoodNode:
+    PREFIX_MAP = {"Raw": "rg", "Intermediary": "ig", "Finished": "fg"}
+
+    def __init__(self,
+                 name: str,
+                 quantity: Optional[float] = None,
+                 unit: Optional[str] = None,
+                 good_type: str = "Raw",
+                 is_finished: bool = False):
+        prefix = self.PREFIX_MAP.get(good_type, "gd")
+        self.id: str = f"{prefix}_{uuid.uuid4().hex}"
+        self.name: str = name
+        self.quantity: Optional[float] = quantity
+        self.unit: Optional[str] = unit
+        self.good_type: str = good_type
+        self.is_finished: bool = is_finished
+        self.used_in: Set['StageNode'] = set()
+        self.made_from: Set['GoodNode'] = set()
+
+    def __repr__(self) -> str:
+        return f"{self.good_type}({self.name}, {self.quantity}{self.unit})"
+
+
+class StageNode:
+    def __init__(self,
+                 number: int,
+                 production_time: str,
+                 outsource: str,
+                 wastage_entries: Dict[str, Dict[str, Any]]):
+        self.id: str = f"STG_{uuid.uuid4().hex}"
+        self.number: int = number
+        self.production_time: str = production_time
+        self.outsource: str = outsource
+        self.wastage_entries: Dict[str, Dict[str, Any]] = wastage_entries
+        self.raw_inputs: Set[GoodNode] = set()
+        self.intermediary_inputs: Set[GoodNode] = set()
+        self.outputs: Set[GoodNode] = set()
+        self.next_stage: Optional['StageNode'] = None
+
+    def __repr__(self) -> str:
+        return f"Stage({self.number})"
+
+
+class ProductionGraph:
+    def __init__(self,
+                 uri: Optional[str] = None,
+                 user: Optional[str] = None,
+                 password: Optional[str] = None):
+        self.stages: Dict[int, StageNode] = {}
+        self.goods: Set[GoodNode] = set()
+        self.name_map: Dict[str, GoodNode] = {}
+
+        # Neo4j/Aura credentials
+        self._uri = uri or NEO4J_URI
+        self._user = user or NEO4J_USERNAME
+        self._password = password or NEO4J_PASSWORD
+        self._driver = None
+
+    def _ensure_driver(self):
+        if not self._driver:
+            self._driver = GraphDatabase.driver(
+                self._uri,
+                auth=(self._user, self._password)
+            )
+        return self._driver
+
+    def clear_db(self) -> None:
+        driver = self._ensure_driver()
+        with driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+
+    def get_or_create_good(self,
+                           name: str,
+                           quantity: Optional[float],
+                           unit: Optional[str],
+                           good_type: str,
+                           is_finished: bool) -> GoodNode:
+        if name in self.name_map:
+            return self.name_map[name]
+        node = GoodNode(name, quantity, unit, good_type, is_finished)
+        self.goods.add(node)
+        self.name_map[name] = node
+        return node
+
+    def add_stage(self,
+                  number: int,
+                  production_time: str,
+                  outsource: str,
+                  wastage_entries: Dict[str, Dict[str, Any]],
+                  raw_inputs: Set[GoodNode],
+                  intermediary_inputs: Set[GoodNode],
+                  outputs: Set[GoodNode]) -> None:
+        stage = StageNode(number, production_time, outsource, wastage_entries)
+        stage.raw_inputs = raw_inputs
+        stage.intermediary_inputs = intermediary_inputs
+        stage.outputs = outputs
+
+        for out in outputs:
+            for inp in raw_inputs | intermediary_inputs:
+                out.made_from.add(inp)
+                inp.used_in.add(out)
+
+        self.stages[number] = stage
+
+    def link_stages(self) -> None:
+        for num in sorted(self.stages):
+            if num + 1 in self.stages:
+                self.stages[num].next_stage = self.stages[num + 1]
+
+    def load_from_json(self, data: Dict[str, Any]) -> None:
+        stages_data = data.get("productionStages", [])
+        max_stage = max(s["stageNumber"] for s in stages_data) if stages_data else None
+
+        for s in stages_data:
+            num = s["stageNumber"]
+            det = s["productionDetails"]
+
+            raw_set = {
+                self.get_or_create_good(
+                    r["goodName"], r.get("quantity"), r.get("unit"), "Raw", False
+                ) for r in s.get("rawGoods", [])
+            }
+
+            out_set: Set[GoodNode] = set()
+            for i, o in enumerate(s.get("outputGoods", [])):
+                is_fin = (num == max_stage and i == len(s["outputGoods"]) - 1)
+                gt = "Finished" if is_fin else "Intermediary"
+                out_set.add(
+                    self.get_or_create_good(
+                        o["goodName"], o.get("quantity"), o.get("unit"), gt, is_fin
+                    )
+                )
+
+            wastage = {
+                self.name_map[w["goodName"]].id: {"wastage": w["wastage"], "type": w["wastageType"]}
+                for w in det.get("wastageEntries", [])
+                if w["goodName"] in self.name_map
+            }
+
+            self.add_stage(num, det["productionTime"], det["outsource"], wastage, raw_set, set(), out_set)
+
+        self.link_stages()
+        self.save_to_neo4j()
+
+    def save_to_neo4j(self) -> None:
+        driver = self._ensure_driver()
+        def tx(tx):
+            for st in self.stages.values():
+                tx.run(
+                    "MERGE (s:Stage {id:$id}) "
+                    "SET s.number=$num, s.name=$name, s.time=$time, s.outsource=$out, s.color='#CCCCCC'",
+                    id=st.id, num=st.number, name=f"Stage {st.number}", time=st.production_time, out=st.outsource
+                )
+            for g in self.goods:
+                label = f"{g.good_type}Good"
+                color = {'Raw':'#ADD8E6','Intermediary':'#FFA500','Finished':'#FF4500'}[g.good_type]
+                tx.run(
+                    f"MERGE (n:Good:{label} {{id:$id}}) "
+                    "SET n.name=$name, n.quantity=$q, n.unit=$u, n.color=$col",
+                    id=g.id, name=g.name, q=g.quantity, u=g.unit, col=color
+                )
+            for st in self.stages.values():
+                for inp in st.raw_inputs | st.intermediary_inputs:
+                    tx.run(
+                        "MATCH (n:Good {id:$gid}), (s:Stage {id:$sid}) "
+                        "MERGE (n)-[:USED_IN]->(s)",
+                        gid=inp.id, sid=st.id
+                    )
+                for out in st.outputs:
+                    tx.run(
+                        "MATCH (s:Stage {id:$sid}), (n:Good {id:$gid}) "
+                        "MERGE (s)-[:PRODUCES]->(n)",
+                        sid=st.id, gid=out.id
+                    )
+                for gid, w in st.wastage_entries.items():
+                    tx.run(
+                        "MATCH (n:Good {id:$gid})-[r:USED_IN]->(s:Stage {id:$sid}) "
+                        "SET r.wastage=$w, r.wastageType=$t",
+                        gid=gid, sid=st.id, w=w['wastage'], t=w['type']
+                    )
+        with driver.session() as session:
+            session.write_transaction(tx)
+
+    def display(self) -> None:
+        for num, st in sorted(self.stages.items()):
+            raws = [g.name for g in st.raw_inputs]
+            outs = [g.name for g in st.outputs]
+            print(f"Stage {num}: RAW={raws}, OUT={outs}")
+
+
+# -------------------------------
+# Pydantic request model
+# -------------------------------
+
+class WastageEntryModel(BaseModel):
     goodName: str
     wastage: float
     wastageType: str
 
-class GoodEntry(BaseModel):
+class GoodEntryModel(BaseModel):
     goodName: str
     quantity: float
     unit: str
 
-class ProductionDetails(BaseModel):
-    wastageEntries: List[WastageEntry]
+class ProductionDetailsModel(BaseModel):
+    wastageEntries: List[WastageEntryModel]
     productionTime: str
     outsource: str
 
-class Stage(BaseModel):
+class StageModel(BaseModel):
     stageNumber: int
-    rawGoods: List[GoodEntry]
-    outputGoods: List[GoodEntry]
-    productionDetails: ProductionDetails
+    rawGoods: List[GoodEntryModel]
+    outputGoods: List[GoodEntryModel]
+    productionDetails: ProductionDetailsModel
 
-class StageWorkflowCreate(BaseModel):
-    name: str
-    description: Optional[str]
-    productionStages: List[Stage]
-
-class StageWorkflowResponse(StageWorkflowCreate):
-    id: str
-    created_at: datetime
-
-# Helper
+class WorkflowCreateModel(BaseModel):
+    productionStages: List[StageModel]
 
 
-# API Routes
-@app.get("/")
+@app.get("/", response_model=dict)
 async def read_root():
-    return {"message": "Production Workflow API"}
+    return {"message": "Production Workflow API — Neo4j only"}
 
-@app.post("/workflows", response_model=StageWorkflowResponse, status_code=status.HTTP_201_CREATED)
-async def create_stage_workflow(workflow: StageWorkflowCreate):
+@app.post(
+    "/workflows",
+    status_code=status.HTTP_201_CREATED,
+    response_model=dict
+)
+async def create_stage_workflow(workflow: WorkflowCreateModel):
     try:
         graph = ProductionGraph()
-        graph.load_from_json(workflow.dict())
-        graph.link_stages()
+        graph.clear_db()                     # remove old data
+        graph.load_from_json(workflow.dict())  # build & save new
 
-        workflow_dict = workflow.dict()
-        workflow_dict["created_at"] = datetime.now()
+        buffer = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buffer
+        graph.display()
+        sys.stdout = old_stdout
 
-        result = workflows_collection.insert_one(workflow_dict)
-        return {**workflow_dict, "id": str(result.inserted_id)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating workflow: {str(e)}")
-
-@app.get("/workflows", response_model=List[StageWorkflowResponse])
-async def list_workflows():
-    workflows = []
-    for wf in workflows_collection.find():
-        wf["id"] = str(wf.pop("_id"))
-        workflows.append(wf)
-    return workflows
-
-@app.get("/workflows/{workflow_id}", response_model=StageWorkflowResponse)
-async def get_workflow(workflow_id: str):
-    try:
-        workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
-        if not workflow:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-        workflow["id"] = str(workflow.pop("_id"))
-        return workflow
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving workflow: {str(e)}")
-
-@app.get("/workflows/{workflow_id}/dependencies/{finished_good}")
-async def get_dependencies(workflow_id: str, finished_good: str):
-    try:
-        workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
-        if not workflow:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-
-        graph = ProductionGraph()
-        graph.load_from_json(workflow)
-        graph.link_stages()
-        fg_node = next((n for n in graph.goods if n.name == finished_good and n.is_finished), None)
-        if not fg_node:
-            raise HTTPException(status_code=404, detail=f"Finished good '{finished_good}' not found")
-
-        raw_deps = set()
-        def trace_raws(node):
-            for parent in node.made_from:
-                if parent.good_type == "Raw":
-                    raw_deps.add((parent.name, parent.quantity, parent.unit))
-                else:
-                    trace_raws(parent)
-
-        trace_raws(fg_node)
         return {
-            "finished_good": finished_good,
-            "raw_dependencies": [
-                {"name": name, "quantity": qty, "unit": unit} for name, qty, unit in sorted(raw_deps)
-            ]
+            "saved_at": datetime.utcnow(),
+            "display": buffer.getvalue().splitlines()
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error tracing dependencies: {str(e)}")
-
-@app.get("/workflows/{workflow_id}/display")
-async def display_workflow(workflow_id: str):
-    try:
-        workflow = workflows_collection.find_one({"_id": ObjectId(workflow_id)})
-        if not workflow:
-            raise HTTPException(status_code=404, detail="Workflow not found")
-
-        graph = ProductionGraph()
-        graph.load_from_json(workflow)
-        graph.link_stages()
-        response = []
-        for num in sorted(graph.stages):
-            stage = graph.stages[num]
-            response.append({
-                "stageNumber": num,
-                "productionTime": stage.production_time,
-                "outsource": stage.outsource,
-                "wastageEntries": stage.wastage_entries,
-                "rawGoods": [
-                    {"name": g.name, "quantity": g.quantity, "unit": g.unit}
-                    for g in stage.raw_inputs
-                ],
-                "intermediaryGoods": [
-                    {
-                        "name": g.name,
-                        "quantity": g.quantity,
-                        "unit": g.unit,
-                        "from": [p.name for p in g.made_from]
-                    }
-                    for g in stage.outputs
-                ]
-            })
-        return {"stages": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error displaying workflow: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error saving or displaying workflow: {e}"
+        )
